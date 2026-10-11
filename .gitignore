@@ -1,0 +1,7 @@
+target/
+.idea/
+*.iml
+.DS_Store
+# Market data files are several GB: never commit them
+data/
+*.gz
