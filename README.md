@@ -28,9 +28,17 @@ NASDAQ top of book at the 4 p.m. close, as rebuilt by the replay:
 | MSFT | 172.73 × 17,031 | 172.75 × 15,237 |
 | TSLA | 640.77 × 1,000 | 640.93 × 264 |
 
-Measured on an Apple Silicon MacBook M2 Pro, JDK 21. Throughput is a single end-to-end run, not yet a controlled benchmark; see the [roadmap](#roadmap).
+Measured on an Apple Silicon MacBook M2 Pro, JDK 21. Throughput above is a single end-to-end run.
 
-What the day's messages show about real markets: **186.6M orders were added and 180.3M deleted, but only ~8.6M executions happened**. About 95% of orders never trade; they're placed and cancelled as traders continually reprice.
+**Order book alone** (controlled benchmark: 60M real events from 3 a.m. to 10:01 a.m. including the open, replayed from memory, 3 warm-ups + 5 runs, full method in [BENCHMARKS.md](BENCHMARKS.md)):
+
+| Throughput | p50 | p99 | p99.9 | max |
+|---|---|---|---|---|
+| 3.06M events/s (±3%), 327 ns/event | 167 ns | 2.5 µs | 7.8 µs | 143 ms (a GC pause) |
+
+**Where a full-day replay spends its time:** book updates **83%**, decompression 9%, parsing 7% (34M messages/s on its own), disk 1%. Profiling the book with JDK Flight Recorder points to `TreeMap` price-level lookups (~37% of samples), `HashMap` order lookups (~31%) and the O(n) queue scan on deletes (~11%), which set the order of the optimizations below.
+
+What the day's messages show about real markets: **186.6M orders were added and 180.3M deleted, but only ~8.6M executions happened**. At least 95% of orders never trade; they're placed and cancelled as traders continually reprice.
 
 ## Architecture
 
@@ -65,7 +73,7 @@ The parser never touches a book and the book never sees a byte: the listener int
 
 **ITCH parsing is absolute and unsigned.** Each field is read at its exact spec offset (`msg.getInt(32)`), and every number is masked to unsigned (`getInt(off) & 0xFFFFFFFFL`), because Java's integer types are signed and ITCH's aren't. The 6-byte timestamp is assembled from a 2-byte and a 4-byte read.
 
-**Streaming with one reused buffer.** The reader holds one message at a time in a single 64 KB buffer (the largest size a 2-byte length can express), so a 12 GB day never needs to fit in memory and no per-message arrays are allocated.
+**Streaming with one reused buffer.** The reader holds one message at a time in a single 64 KB buffer (the largest size a 2-byte length can express), so a ~13 GB uncompressed day never needs to fit in memory and no per-message arrays are allocated.
 
 ## How correctness is checked
 
@@ -112,8 +120,8 @@ The `.gz` is decompressed while streaming, never unpacked to disk. The report pr
 
 - [x] Matching engine with price-time priority
 - [x] ITCH 5.0 parser and full-day replay with health checks
-- [ ] **Benchmarks**: separate decompression, parsing and book time; JMH book benchmarks; per-message latency percentiles (p50 / p99 / p99.9) with HdrHistogram
-- [ ] **Optimizations**, each measured before and after:
+- [x] **Benchmarks** ([BENCHMARKS.md](BENCHMARKS.md)): stage-by-stage timing of the full day, an in-memory book benchmark with warm-up and repeated runs, per-event latency percentiles, and a JDK Flight Recorder profile
+- [ ] **Optimizations**, in the order the profile suggests, each measured before and after in [BENCHMARKS.md](BENCHMARKS.md):
   - `PriceLevel` with an intrusive doubly linked list of orders: O(1) cancel from anywhere
   - running level totals: O(1) `volumeAt`
   - array of books indexed by stock locate instead of a `HashMap`

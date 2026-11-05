@@ -5,3 +5,4 @@ target/
 # Market data files are several GB: never commit them
 data/
 *.gz
+*.jfr
