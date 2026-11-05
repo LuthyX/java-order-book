@@ -1,6 +1,5 @@
 package com.orderbook.core;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -14,11 +13,14 @@ import java.util.TreeMap;
  * A limit order book for ONE stock, with price-time priority matching.
  *
  * Data structures:
- *   bids        TreeMap<price, FIFO queue>  HIGHEST price first (reverse order)
- *   asks        TreeMap<price, FIFO queue>  LOWEST price first (natural order)
- *   ordersById  HashMap<id, Order>          every RESTING order, for O(1) lookup on cancel
+ *   bids        TreeMap<price, PriceLevel>  HIGHEST price first (reverse order)
+ *   asks        TreeMap<price, PriceLevel>  LOWEST price first (natural order)
+ *   ordersById  HashMap<id, Order>          every RESTING order, for O(1) lookup by id
  *
  * Because bids are reversed, firstKey() is the BEST price on both sides.
+ * Each PriceLevel is an intrusive linked list of its orders (FIFO), and each resting Order
+ * points back to its level, so removing an order touches neither the TreeMap (unless its
+ * level becomes empty) nor any other order in the queue: O(1).
  *
  * Matching rules:
  *   1. An incoming order matches against the OPPOSITE side, best price first.
@@ -31,8 +33,8 @@ import java.util.TreeMap;
  */
 public class OrderBook {
 
-    private final TreeMap<Long, ArrayDeque<Order>> bids = new TreeMap<>(Collections.reverseOrder());
-    private final TreeMap<Long, ArrayDeque<Order>> asks = new TreeMap<>();
+    private final TreeMap<Long, PriceLevel> bids = new TreeMap<>(Collections.reverseOrder());
+    private final TreeMap<Long, PriceLevel> asks = new TreeMap<>();
     private final Map<Long, Order> ordersById = new HashMap<>();
     private long nextSeq = 0;
 
@@ -82,10 +84,11 @@ public class OrderBook {
     private List<Trade> match(Order incoming, boolean isMarket) {
         List<Trade> trades = new ArrayList<>();   // local: only THIS order's trades (fixes bug 1)
         Side side = incoming.side();
-        TreeMap<Long, ArrayDeque<Order>> oppositeBook = (side == Side.BUY) ? asks : bids;
+        TreeMap<Long, PriceLevel> oppositeBook = (side == Side.BUY) ? asks : bids;
 
         while (!incoming.isFilled() && !oppositeBook.isEmpty()) {
-            long bestPrice = oppositeBook.firstKey();   // rule 1: best opposite price
+            PriceLevel level = oppositeBook.firstEntry().getValue();   // rule 1: best opposite price
+            long bestPrice = level.price;
 
             // Rule 4: stop if the best opposite price is worse than our limit (market orders skip this).
             if (!isMarket && ((side == Side.BUY && incoming.price() < bestPrice)
@@ -93,9 +96,8 @@ public class OrderBook {
                 break;
             }
 
-            ArrayDeque<Order> ordersAtBestPrice = oppositeBook.get(bestPrice);
-            while (!ordersAtBestPrice.isEmpty() && !incoming.isFilled()) {
-                Order restingOrder = ordersAtBestPrice.getFirst();   // rule 2: front of the queue
+            while (!level.isEmpty() && !incoming.isFilled()) {
+                Order restingOrder = level.head;   // rule 2: front of the queue
                 long tradeQty = Math.min(incoming.remainingQty(), restingOrder.remainingQty());
 
                 // Rule 3: trade at the RESTING order's price.
@@ -105,11 +107,11 @@ public class OrderBook {
                         restingOrder.price(),
                         tradeQty));
 
-                incoming.fill(tradeQty);
-                restingOrder.fill(tradeQty);
+                incoming.fill(tradeQty);               // the incoming order isn't in a level yet
+                level.reduce(restingOrder, tradeQty);  // the resting one is: keep totalQty in step
                 if (restingOrder.isFilled()) {
-                    // Takes it out of the queue AND removes the level if that empties it (rule 6).
-                    // The inner loop then ends because ordersAtBestPrice is empty.
+                    // Unlinks it AND removes the level if that empties it (rule 6).
+                    // The inner loop then ends because the level is empty.
                     removeFromBook(restingOrder);
                 }
                 // A partly filled resting order stays at the front: it keeps its priority.
@@ -159,7 +161,7 @@ public class OrderBook {
                     + ", only " + order.remainingQty() + " remaining");
         }
 
-        order.fill(quantity);   // same arithmetic as a fill: remaining -= quantity
+        order.level.reduce(order, quantity);   // order AND level total go down together
         if (order.isFilled()) {
             removeFromBook(order);
         }
@@ -197,26 +199,27 @@ public class OrderBook {
 
     /** Put an order at the BACK of its price level's queue (creating the level if needed) and index it. */
     private void rest(Order order) {
-        TreeMap<Long, ArrayDeque<Order>> sameBook = (order.side() == Side.BUY) ? bids : asks;
-        sameBook.computeIfAbsent(order.price(), k -> new ArrayDeque<>()).addLast(order);
+        TreeMap<Long, PriceLevel> sameBook = (order.side() == Side.BUY) ? bids : asks;
+        // The one TreeMap lookup an order ever needs: finding (or creating) its level on arrival.
+        sameBook.computeIfAbsent(order.price(), PriceLevel::new).append(order);
         ordersById.put(order.id(), order);
     }
 
     /**
-     * The one place an order leaves the book: out of its queue, out of the id index,
-     * and its price level removed if that leaves it empty (rule 6).
+     * The one place an order leaves the book: unlinked from its level, out of the id index,
+     * and its level removed if that leaves it empty (rule 6).
      * Used by match() (filled), reduce() (reduced to zero) and cancel().
      */
     private void removeFromBook(Order order) {
-        TreeMap<Long, ArrayDeque<Order>> sameBook = (order.side() == Side.BUY) ? bids : asks;
-        ArrayDeque<Order> ordersAtPrice = sameBook.get(order.price());
+        // order.level replaces the old sameBook.get(price): no TreeMap lookup to find the queue,
+        // and remove() unlinks in O(1) instead of scanning the queue for the order.
+        PriceLevel level = order.level;
+        level.remove(order);
 
-        // Known slow spot, a Phase 4 target: ArrayDeque.remove(Object) scans from the front,
-        // so it's instant for the front order (the usual case in match) but O(n) mid-queue.
-        ordersAtPrice.remove(order);
-
-        if (ordersAtPrice.isEmpty()) {
-            sameBook.remove(order.price());
+        if (level.isEmpty()) {
+            // Only now is the TreeMap touched again: the price has no orders left.
+            TreeMap<Long, PriceLevel> sameBook = (order.side() == Side.BUY) ? bids : asks;
+            sameBook.remove(level.price);
         }
         ordersById.remove(order.id());
     }
@@ -233,15 +236,8 @@ public class OrderBook {
 
     /** Total remaining quantity resting at one price on one side (0 if none). */
     public long volumeAt(Side side, long price) {
-        ArrayDeque<Order> ordersAtPrice = ((side == Side.BUY) ? bids : asks).get(price);
-        if (ordersAtPrice == null) {
-            return 0;
-        }
-        long total = 0;
-        for (Order order : ordersAtPrice) {
-            total += order.remainingQty();
-        }
-        return total;
+        PriceLevel level = ((side == Side.BUY) ? bids : asks).get(price);
+        return (level == null) ? 0 : level.totalQty;   // kept up to date by PriceLevel: no loop
     }
 
     /** A resting order by id, or empty if it isn't (or is no longer) in the book. */
@@ -252,5 +248,51 @@ public class OrderBook {
     /** How many orders are resting in this book right now. O(1): it's the id index's size. */
     public int orderCount() {
         return ordersById.size();
+    }
+
+    /**
+     * For tests: walks every level and checks that the linked lists, totals and id index
+     * all agree. Throws IllegalStateException describing the first problem found.
+     * O(total orders), so it's only for tests, never for the hot path.
+     */
+    void checkInvariants() {
+        int ordersInLevels = 0;
+        for (Side side : Side.values()) {
+            TreeMap<Long, PriceLevel> book = (side == Side.BUY) ? bids : asks;
+            for (Map.Entry<Long, PriceLevel> entry : book.entrySet()) {
+                PriceLevel level = entry.getValue();
+                String where = side + " level " + entry.getKey();
+                if (level.price != entry.getKey()) fail(where + ": key and level.price differ");
+                if (level.isEmpty()) fail(where + ": empty level left in the book (rule 6)");
+                if (level.head.prev != null) fail(where + ": head has a prev");
+                if (level.tail.next != null) fail(where + ": tail has a next");
+
+                long qty = 0;
+                int count = 0;
+                Order previous = null;
+                for (Order o = level.head; o != null; o = o.next) {
+                    if (o.prev != previous) fail(where + ": broken back-link at order " + o.id());
+                    if (o.level != level) fail(where + ": order " + o.id() + " points at the wrong level");
+                    if (o.side() != side || o.price() != level.price) fail(where + ": order " + o.id() + " in the wrong level");
+                    if (o.remainingQty() <= 0) fail(where + ": filled order " + o.id() + " still resting");
+                    if (ordersById.get(o.id()) != o) fail(where + ": order " + o.id() + " missing from ordersById");
+                    if (previous != null && o.seq() <= previous.seq()) fail(where + ": queue out of arrival order at " + o.id());
+                    qty += o.remainingQty();
+                    count++;
+                    previous = o;
+                }
+                if (previous != level.tail) fail(where + ": tail isn't the last order");
+                if (qty != level.totalQty) fail(where + ": totalQty " + level.totalQty + " but orders sum to " + qty);
+                if (count != level.orderCount) fail(where + ": orderCount " + level.orderCount + " but found " + count);
+                ordersInLevels += count;
+            }
+        }
+        if (ordersInLevels != ordersById.size()) {
+            fail(ordersById.size() + " orders in ordersById but " + ordersInLevels + " in levels");
+        }
+    }
+
+    private static void fail(String message) {
+        throw new IllegalStateException(message);
     }
 }

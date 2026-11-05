@@ -18,6 +18,21 @@ Note: on Apple Silicon, `System.nanoTime()` ticks in steps of about 42 ns, so pe
 | Version | Throughput (events/s) | ns/event | p50 | p99 | p99.9 | p99.99 | max | GC per run |
 |---|---|---|---|---|---|---|---|---|
 | **Baseline**: TreeMap + ArrayDeque + HashMap | 3,056,529 (±3%) | 327 | 167 ns | 2.5 µs | 7.8 µs | 54 µs | 143 ms | 8.6 collections, 369 ms |
+| **1. `PriceLevel`**: intrusive linked list, order → level back-pointer, running `totalQty` | 4,437,475 (±1.9%) | 225 | 125 ns | 1.1 µs | 5.4 µs | 16 µs | 82 ms | 5.0 collections, 213 ms |
+| *change vs previous* | **+45%** | −31% | −25% | **2.3× better** | −31% | **3.3× better** | −42% | −42% GC time |
+
+### 1. `PriceLevel`
+
+**What changed:** each price level's `ArrayDeque<Order>` became a `PriceLevel` whose orders form an intrusive doubly linked list (`prev` / `next` fields on `Order`), and each resting order points back to its level. Removing an order (delete, full execution, cancel) now unlinks it in O(1) and only touches the `TreeMap` if the level becomes empty; before, it looked the level up in the `TreeMap` again and scanned the queue for the order. `volumeAt` reads a running total instead of summing the queue.
+
+**Why the numbers moved:**
+- Throughput: removes the profile's two largest book hotspots, the repeated `TreeMap.getEntry` (~20% of samples) and the `ArrayDeque` scan (~11%).
+- Tail latency improved most (p99 2.3×, p99.99 3.3×): the slowest events were deletes deep in long queues around the open, which are now O(1).
+- GC down 42% despite `Order` gaining three fields: no `ArrayDeque` objects or backing arrays per level, which were allocated, grown and discarded as levels came and went.
+
+**Correctness:** 103 tests, including linked-list tests for every unlink position and 200,000 randomized operations with a full structural check (links, totals, counts, id index). A deliberately planted bug (tail not updated on removal) passed all 93 earlier tests and was caught only by the new ones. Replaying 150 MB of real ITCH through the old and new books gave identical results.
+
+**Still to fix:** the max (82 ms) is still a GC pause.
 
 ## Where the time goes (full day, end to end)
 
@@ -43,7 +58,7 @@ GC pauses over the full day: 80 pauses, 4.5 s total; median 44 ms, p99 649 ms.
 
 ## Planned changes, in order of the profile
 
-1. `PriceLevel` with an intrusive doubly linked list, and each `Order` pointing back to its level: removes the second `TreeMap` lookup and the O(n) scan
+1. ~~`PriceLevel` with an intrusive doubly linked list, and each `Order` pointing back to its level~~ **done: +45%**
 2. Books indexed by stock locate in an array; one id lookup instead of two on add
 3. Primitive `long → Order` map (no boxing)
 4. Faster price-level lookup for adds
