@@ -32,9 +32,13 @@ Measured on an Apple Silicon MacBook M2 Pro, JDK 21. Throughput above is a singl
 
 **Order book alone** (controlled benchmark: 60M real events from 3 a.m. to 10:01 a.m. including the open, replayed from memory, 3 warm-ups + 5 runs, full method in [BENCHMARKS.md](BENCHMARKS.md)):
 
-| Throughput | p50 | p99 | p99.9 | max |
-|---|---|---|---|---|
-| 3.06M events/s (±3%), 327 ns/event | 167 ns | 2.5 µs | 7.8 µs | 143 ms (a GC pause) |
+| Version | Throughput | p50 | p99 | p99.9 | max |
+|---|---|---|---|---|---|
+| Baseline | 3.06M events/s (±3%), 327 ns/event | 167 ns | 2.5 µs | 7.8 µs | 143 ms (a GC pause) |
+| + `PriceLevel` (O(1) cancel) | **4.44M events/s (±1.9%), 225 ns/event: +45%** | 125 ns | **1.1 µs** | 5.4 µs | 82 ms |
+| + books array, fewer id lookups | **5.44M events/s (±3.6%), 184 ns/event: +22% (+78% total)** | **84 ns** | 1.1 µs | 6.5 µs | 114 ms |
+
+Throughput and median keep improving; the worst case is still set by garbage-collection pauses, which the remaining changes target.
 
 **Where a full-day replay spends its time:** book updates **83%**, decompression 9%, parsing 7% (34M messages/s on its own), disk 1%. Profiling the book with JDK Flight Recorder points to `TreeMap` price-level lookups (~37% of samples), `HashMap` order lookups (~31%) and the O(n) queue scan on deletes (~11%), which set the order of the optimizations below.
 
@@ -63,7 +67,9 @@ The parser never touches a book and the book never sees a byte: the listener int
 
 **Prices are `long`s in 1/10,000 of a dollar**, the same units ITCH uses ($10.25 is `102_500`). `double` can't represent most decimal prices exactly (`0.1 + 0.2 != 0.3`), which would split equal prices into different price levels. `BigDecimal` is exact but allocates on every operation. A `long` is exact, allocation-free, and wide enough for unsigned 32-bit ITCH prices and price × quantity.
 
-**Each side is a `TreeMap<price, FIFO queue>`**, with bids in reverse order so `firstKey()` is the best price on both sides. Price priority comes from the map's ordering, time priority from the queue. A `HashMap<id, Order>` gives O(1) lookup for cancels.
+**Each side is a `TreeMap<price, PriceLevel>`**, with bids in reverse order so `firstKey()` is the best price on both sides. Price priority comes from the map's ordering, time priority from each level's FIFO queue. A `HashMap<id, Order>` finds any resting order in O(1).
+
+**Each `PriceLevel` is an intrusive doubly linked list.** The orders themselves are the list nodes (`prev` / `next` fields), and each order points back to its level. So once an order is found by id, removing it is two pointer updates, wherever it sits in the queue, and the `TreeMap` is only touched when a level becomes empty. A running `totalQty` makes the volume at a price O(1). Every change to a resting order's quantity goes through the level, so the total can't drift.
 
 **Every trade prints at the resting order's price.** An incoming order that crosses gets price improvement; its limit is a maximum (or minimum), not the price it pays.
 
@@ -112,8 +118,7 @@ The `.gz` is decompressed while streaming, never unpacked to disk. The report pr
 
 ## Known limitations
 
-- **Cancels from the middle of a price level are O(n).** `ArrayDeque.remove(Object)` scans the queue. That's fine when matching (the order removed is always at the front) but deletes are 42.6% of all messages and can target any position. Planned fix below.
-- **`volumeAt` is O(orders at that price)**; it sums the queue on each call.
+- **Garbage-collection pauses** still set the worst case (around 100 ms max): every order is a new object, and ids are boxed `Long`s in a `HashMap`. Planned fixes below.
 - **NASDAQ's book only.** US stocks trade on many exchanges at once; this rebuilds NASDAQ's slice, not the consolidated best price (NBBO). Hidden orders never appear in ITCH, so trades against them (`P` messages) are counted but not applied.
 
 ## Roadmap
@@ -122,9 +127,8 @@ The `.gz` is decompressed while streaming, never unpacked to disk. The report pr
 - [x] ITCH 5.0 parser and full-day replay with health checks
 - [x] **Benchmarks** ([BENCHMARKS.md](BENCHMARKS.md)): stage-by-stage timing of the full day, an in-memory book benchmark with warm-up and repeated runs, per-event latency percentiles, and a JDK Flight Recorder profile
 - [ ] **Optimizations**, in the order the profile suggests, each measured before and after in [BENCHMARKS.md](BENCHMARKS.md):
-  - `PriceLevel` with an intrusive doubly linked list of orders: O(1) cancel from anywhere
-  - running level totals: O(1) `volumeAt`
-  - array of books indexed by stock locate instead of a `HashMap`
+  - [x] `PriceLevel` with an intrusive doubly linked list of orders and a running total: O(1) cancel from anywhere, O(1) `volumeAt` (**+45% throughput, p99 2.3× better**)
+  - [x] array of books indexed by stock locate instead of a `HashMap`, and one id lookup instead of two on add and delete (**+22% throughput, median −33%**)
   - primitive `long → Order` map instead of boxed `Long` keys
   - object pooling to cut garbage-collection pauses
 - [ ] Priority check against the real feed: does each execution hit the order my book says is first in line?

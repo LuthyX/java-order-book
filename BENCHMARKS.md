@@ -20,6 +20,9 @@ Note: on Apple Silicon, `System.nanoTime()` ticks in steps of about 42 ns, so pe
 | **Baseline**: TreeMap + ArrayDeque + HashMap | 3,056,529 (±3%) | 327 | 167 ns | 2.5 µs | 7.8 µs | 54 µs | 143 ms | 8.6 collections, 369 ms |
 | **1. `PriceLevel`**: intrusive linked list, order → level back-pointer, running `totalQty` | 4,437,475 (±1.9%) | 225 | 125 ns | 1.1 µs | 5.4 µs | 16 µs | 82 ms | 5.0 collections, 213 ms |
 | *change vs previous* | **+45%** | −31% | −25% | **2.3× better** | −31% | **3.3× better** | −42% | −42% GC time |
+| **2. Books array + fewer id lookups** | 5,436,723 (±3.6%) | 184 | 84 ns | 1.1 µs | 6.5 µs | 31 µs | 114 ms | 4.2 collections, 220 ms |
+| *change vs previous* | **+22%** | −18% | **−33%** | same | worse | worse | worse | same |
+| *total vs baseline* | **+78%** | −44% | −50% | 2.3× better | −17% | 1.8× better | −20% | −40% GC time |
 
 ### 1. `PriceLevel`
 
@@ -33,6 +36,20 @@ Note: on Apple Silicon, `System.nanoTime()` ticks in steps of about 42 ns, so pe
 **Correctness:** 103 tests, including linked-list tests for every unlink position and 200,000 randomized operations with a full structural check (links, totals, counts, id index). A deliberately planted bug (tail not updated on removal) passed all 93 earlier tests and was caught only by the new ones. Replaying 150 MB of real ITCH through the old and new books gave identical results.
 
 **Still to fix:** the max (82 ms) is still a GC pause.
+
+### 2. Books array + fewer id lookups
+
+**What changed:**
+- `ReplayListener` finds each stock's book with `books[locate]` (a plain `OrderBook[65536]`) instead of `HashMap<Integer, OrderBook>.get(locate)`. Locates are 2-byte numbers, so the array covers every possible one in about 0.5 MB. This runs on every message.
+- `addResting` checks for a duplicate id and inserts with one `putIfAbsent` instead of `containsKey` + `put`. It's the last check that can fail, so a rejected order still leaves the book unchanged.
+- `cancel` finds and removes the order with one `remove(id)` instead of `get(id)` + `remove(id)`.
+
+**Why the numbers moved:**
+- Throughput +22% and median −33%: the change removes a hash lookup from every message and a second id search from every add and delete, so it makes the *common case* cheaper.
+- The tail (p99.9 and above, max) did not improve. This change creates just as many objects as before (GC time unchanged), and the tail is dominated by GC pauses and rare costly operations such as creating a price level. The tail figures also come from a single timed run, where one GC pause landing differently moves p99.99 and the max considerably; throughput is averaged over five runs.
+- Lesson: throughput and tail latency respond to different fixes. Cheaper common paths raise throughput; a shorter tail needs fewer allocations (changes 3 and 5).
+
+**Correctness:** all 103 tests pass; replaying 150 MB of real ITCH gives results identical to the original book.
 
 ## Where the time goes (full day, end to end)
 
@@ -59,7 +76,7 @@ GC pauses over the full day: 80 pauses, 4.5 s total; median 44 ms, p99 649 ms.
 ## Planned changes, in order of the profile
 
 1. ~~`PriceLevel` with an intrusive doubly linked list, and each `Order` pointing back to its level~~ **done: +45%**
-2. Books indexed by stock locate in an array; one id lookup instead of two on add
+2. ~~Books indexed by stock locate in an array; one id lookup instead of two on add~~ **done: +22% (+78% total)**
 3. Primitive `long → Order` map (no boxing)
 4. Faster price-level lookup for adds
 5. Object pooling to cut GC pauses

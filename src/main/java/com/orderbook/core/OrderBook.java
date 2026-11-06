@@ -132,10 +132,18 @@ public class OrderBook {
      * @throws IllegalArgumentException if quantity <= 0, price <= 0, or the id is already in the book
      */
     public void addResting(long id, Side side, long price, long quantity) {
-        validateNewOrder(id, quantity);
+        validateQuantity(quantity);
         validatePrice(price);
-        // Same as the last step of addLimit, minus the matching.
-        rest(new Order(id, side, price, quantity, nextSeq++));
+        Order order = new Order(id, side, price, quantity, nextSeq++);
+
+        // ONE hash lookup to both check for a duplicate and insert. (Before: containsKey(id)
+        // then put(id, order): two searches for the same id, ~186M adds a day.)
+        // It's the last check that can fail, so "validate, then mutate" still holds: a
+        // duplicate is rejected before anything has changed, and nothing after this can fail.
+        if (ordersById.putIfAbsent(id, order) != null) {
+            throw new IllegalArgumentException("Id already contained in order book: " + id);
+        }
+        addToLevel(order);
     }
 
     /**
@@ -176,20 +184,31 @@ public class OrderBook {
      *         already filled, or already cancelled
      */
     public boolean cancel(long id) {
-        // Filled, cancelled and market orders are never in ordersById, so one lookup covers all cases.
-        Order order = ordersById.get(id);
+        // ONE hash lookup: remove() finds the order AND takes it out of the index in one go.
+        // (Before: get(id), then removeFromBook did remove(id): two searches. Deletes are ~43%
+        // of all ITCH messages.) Filled, cancelled and market orders are never in ordersById,
+        // so a null here covers every "not in the book" case.
+        Order order = ordersById.remove(id);
         if (order == null) {
             return false;
         }
-        removeFromBook(order);
+        unlinkFromLevel(order);
         return true;
     }
 
     // ===================== shared helpers =====================
 
-    /** Checks every new order needs, whichever way it enters the book. */
+    /**
+     * Checks for orders that MATCH before resting (addLimit / addMarket). The duplicate check
+     * must come before matching, because matching changes the book, so these keep a separate
+     * containsKey. addResting (the replay path) doesn't match, so it can use putIfAbsent instead.
+     */
     private void validateNewOrder(long id, long quantity) {
         if (ordersById.containsKey(id)) throw new IllegalArgumentException("Id already contained in order book: " + id);
+        validateQuantity(quantity);
+    }
+
+    private static void validateQuantity(long quantity) {
         if (quantity <= 0) throw new IllegalArgumentException("Quantity can not be less than or equal to 0");
     }
 
@@ -197,22 +216,32 @@ public class OrderBook {
         if (price <= 0) throw new IllegalArgumentException("Price can not be less than or equal to 0");
     }
 
-    /** Put an order at the BACK of its price level's queue (creating the level if needed) and index it. */
+    /** Index an order and put it at the BACK of its price level's queue. Used by addLimit. */
     private void rest(Order order) {
+        ordersById.put(order.id(), order);
+        addToLevel(order);
+    }
+
+    /** Put an order at the BACK of its price level's queue, creating the level if needed. */
+    private void addToLevel(Order order) {
         TreeMap<Long, PriceLevel> sameBook = (order.side() == Side.BUY) ? bids : asks;
         // The one TreeMap lookup an order ever needs: finding (or creating) its level on arrival.
         sameBook.computeIfAbsent(order.price(), PriceLevel::new).append(order);
-        ordersById.put(order.id(), order);
     }
 
     /**
-     * The one place an order leaves the book: unlinked from its level, out of the id index,
-     * and its level removed if that leaves it empty (rule 6).
-     * Used by match() (filled), reduce() (reduced to zero) and cancel().
+     * An order leaves the book: out of the id index and unlinked from its level.
+     * Used by match() (filled) and reduce() (reduced to zero). cancel() removes it from the
+     * index itself (that's its lookup) and calls unlinkFromLevel directly.
      */
     private void removeFromBook(Order order) {
-        // order.level replaces the old sameBook.get(price): no TreeMap lookup to find the queue,
-        // and remove() unlinks in O(1) instead of scanning the queue for the order.
+        ordersById.remove(order.id());
+        unlinkFromLevel(order);
+    }
+
+    /** Unlink an order from its level in O(1), and drop the level if that empties it (rule 6). */
+    private void unlinkFromLevel(Order order) {
+        // order.level replaces a TreeMap lookup, and remove() unlinks without scanning the queue.
         PriceLevel level = order.level;
         level.remove(order);
 
@@ -221,7 +250,6 @@ public class OrderBook {
             TreeMap<Long, PriceLevel> sameBook = (order.side() == Side.BUY) ? bids : asks;
             sameBook.remove(level.price);
         }
-        ordersById.remove(order.id());
     }
 
     /** Highest resting buy price, or empty if there are no bids. */

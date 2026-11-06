@@ -45,9 +45,14 @@ public final class ReplayListener implements ItchListener {
 
     private static final int MAX_PROBLEMS_KEPT = 10;
 
-    // One book per stock, keyed by stock locate. (Phase 4: locates are 1..~9,000, so this can
-    // become a plain OrderBook[] indexed by locate, with no hashing and no boxed Integer keys.)
-    private final Map<Integer, OrderBook> books = new HashMap<>();
+    // One book per stock, indexed DIRECTLY by stock locate: books[13] is AAPL's book.
+    // Locates are small (1..~9,000) and, being 2-byte unsigned numbers, can never exceed 65,535,
+    // so a plain array covers every possible one. Finding a book is one memory read: no hashing,
+    // no boxed Integer key, no bucket search. That runs on every message, ~423 million times a day.
+    // (Before: HashMap<Integer, OrderBook>.) Cost: 65,536 references, about 0.5 MB.
+    private static final int MAX_LOCATES = 1 << 16;
+    private final OrderBook[] books = new OrderBook[MAX_LOCATES];
+    private int bookCount;
     private final Map<Integer, String> symbolsByLocate = new HashMap<>();
     private final Map<String, Integer> locatesBySymbol = new HashMap<>();
 
@@ -93,7 +98,12 @@ public final class ReplayListener implements ItchListener {
     @Override
     public void onAddOrder(int stockLocate, long timestamp, long orderRef, Side side, long shares, long price) {
         count('A', timestamp);   // A and F both arrive here, so they're counted together as 'A'
-        OrderBook book = books.computeIfAbsent(stockLocate, k -> new OrderBook());
+        OrderBook book = books[stockLocate];
+        if (book == null) {                  // this stock's first order: create its book
+            book = new OrderBook();
+            books[stockLocate] = book;
+            bookCount++;
+        }
         try {
             book.addResting(orderRef, side, price, shares);
             restingChanged(+1, timestamp);
@@ -126,7 +136,7 @@ public final class ReplayListener implements ItchListener {
     @Override
     public void onOrderDelete(int stockLocate, long timestamp, long orderRef) {
         count('D', timestamp);
-        OrderBook book = books.get(stockLocate);
+        OrderBook book = books[stockLocate];
         if (book != null && book.cancel(orderRef)) {
             restingChanged(-1, timestamp);
         } else {
@@ -138,7 +148,7 @@ public final class ReplayListener implements ItchListener {
     public void onOrderReplace(int stockLocate, long timestamp, long originalOrderRef, long newOrderRef,
                                long shares, long price) {
         count('U', timestamp);
-        OrderBook book = books.get(stockLocate);
+        OrderBook book = books[stockLocate];
         Optional<Order> original = (book == null) ? Optional.empty() : book.getOrder(originalOrderRef);
         if (original.isEmpty()) {
             unknownOrder("U", stockLocate, originalOrderRef, timestamp);
@@ -165,7 +175,7 @@ public final class ReplayListener implements ItchListener {
     // ===================== shared steps =====================
 
     private void reduce(String type, int stockLocate, long timestamp, long orderRef, long shares) {
-        OrderBook book = books.get(stockLocate);
+        OrderBook book = books[stockLocate];
         if (book == null) {
             unknownOrder(type, stockLocate, orderRef, timestamp);
             return;
@@ -226,7 +236,7 @@ public final class ReplayListener implements ItchListener {
     /** The book for a ticker such as "AAPL", or empty if that stock had no orders (or doesn't exist). */
     public Optional<OrderBook> bookFor(String symbol) {
         Integer locate = locatesBySymbol.get(symbol);
-        return (locate == null) ? Optional.empty() : Optional.ofNullable(books.get(locate));
+        return (locate == null) ? Optional.empty() : Optional.ofNullable(books[locate]);
     }
 
     /** Current best bid/ask and their sizes for a ticker. */
@@ -262,7 +272,8 @@ public final class ReplayListener implements ItchListener {
     /** How many books currently have best bid >= best ask, which a correct replay should never produce. */
     public int crossedBooks() {
         int crossed = 0;
-        for (OrderBook book : books.values()) {
+        for (OrderBook book : books) {
+            if (book == null) continue;      // locate never used or no orders yet
             OptionalLong bid = book.bestBid();
             OptionalLong ask = book.bestAsk();
             if (bid.isPresent() && ask.isPresent() && bid.getAsLong() >= ask.getAsLong()) {
@@ -279,7 +290,7 @@ public final class ReplayListener implements ItchListener {
     public long peakRestingOrders()         { return peakRestingOrders; }
     public long peakRestingTimestamp()      { return peakRestingTimestamp; }
     public long lastTimestamp()             { return lastTimestamp; }
-    public int bookCount()                  { return books.size(); }
+    public int bookCount()                  { return bookCount; }
     public int stockCount()                 { return symbolsByLocate.size(); }
     public Map<String, TopOfBook> closeSnapshot() { return Collections.unmodifiableMap(closeSnapshot); }
 
