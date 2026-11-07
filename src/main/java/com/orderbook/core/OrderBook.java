@@ -2,7 +2,6 @@ package com.orderbook.core;
 
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -15,7 +14,8 @@ import java.util.TreeMap;
  * Data structures:
  *   bids        TreeMap<price, PriceLevel>  HIGHEST price first (reverse order)
  *   asks        TreeMap<price, PriceLevel>  LOWEST price first (natural order)
- *   ordersById  HashMap<id, Order>          every RESTING order, for O(1) lookup by id
+ *   ordersById  LongOrderMap (id -> Order)  every RESTING order, for O(1) lookup by id;
+ *                                           primitive long keys: no boxing, no per-entry objects
  *
  * Because bids are reversed, firstKey() is the BEST price on both sides.
  * Each PriceLevel is an intrusive linked list of its orders (FIFO), and each resting Order
@@ -35,7 +35,9 @@ public class OrderBook {
 
     private final TreeMap<Long, PriceLevel> bids = new TreeMap<>(Collections.reverseOrder());
     private final TreeMap<Long, PriceLevel> asks = new TreeMap<>();
-    private final Map<Long, Order> ordersById = new HashMap<>();
+    // Primitive long -> Order map (see LongOrderMap). Before: HashMap<Long, Order>, which created
+    // a boxed Long and a HashMap.Node for every order, ~186 million of each per day.
+    private final LongOrderMap ordersById = new LongOrderMap();
     private long nextSeq = 0;
 
     /**
