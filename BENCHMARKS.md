@@ -1,41 +1,48 @@
 # Benchmarks
 
-All numbers from the same machine and the same workload, so each change can be compared with the one before.
-
-**Machine:** Apple Silicon MacBook M2 Pro, JDK 21, `-Xmx8g`
+**Machine:** Apple Silicon MacBook M2 Pro, JDK 21, `-Xmx8g`, on mains power with other apps closed
 **Workload:** first 60,000,000 book-changing events (A/F, E, C, X, D, U) of NASDAQ ITCH 5.0, January 30, 2020, covering 3:02 a.m. to 10:01 a.m. New York time, including the 9:30 open. Events are decoded once and replayed from memory, so the numbers measure the order book alone: no disk, decompression or parsing.
 
 ```bash
-MAVEN_OPTS="-Xmx8g" mvn -q compile exec:java -Dexec.args="bench data/01302020.NASDAQ_ITCH50.gz 60000000"
+MAVEN_OPTS="-Xmx8g" mvn -q compile exec:java -Dexec.args="bench data/01302020.NASDAQ_ITCH50.gz 60000000 3 10"
 ```
 
-Method: 3 warm-up runs (discarded), then 5 timed runs on fresh, empty books; then one run timing every event individually. Throughput spread across runs is about 3%, so a change has to beat the previous result by more than ~6% to count as a real improvement.
+**Method:** 3 warm-up runs (discarded), then 10 timed runs on fresh, empty books; then one run timing every event individually. **Every version below was measured on the same day under the same conditions**, by checking out each commit in turn. Spread across runs was 0.3–3.3%.
 
-Note: on Apple Silicon, `System.nanoTime()` ticks in steps of about 42 ns, so per-event latencies are rounded to that granularity and values below ~50 ns aren't meaningful.
+**Why same-session matters:** the same code measured on different days varied by up to ~20% depending on power, background apps and temperature. An earlier, cross-day comparison credited `PriceLevel` with +45%; measured side by side with the baseline it is +19%. Only same-session comparisons are used here.
+
+**Timer note:** on Apple Silicon, `System.nanoTime()` ticks in steps of about 42 ns, so per-event latencies are rounded to that granularity (84 ns = 2 ticks) and values below ~50 ns aren't meaningful. Latency percentiles come from a single timed run, so the far tail (p99.99, max) is noisier than throughput, which is averaged over 10 runs.
 
 ## Results
 
-| Version | Throughput (events/s) | ns/event | p50 | p99 | p99.9 | p99.99 | max | GC per run |
+| Version | Throughput (events/s) | ns/event | GC per run | p50 | p90 | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|---|---|---|---|
+| **Baseline**: `TreeMap` + `ArrayDeque` + `HashMap` | 4,515,305 (±0.3%) | 221 | 7.8 collections, 124 ms | 166 ns | 459 ns | 1.08 µs | 2.7 µs | 7.3 µs | 40.1 ms |
+| **1. `PriceLevel`** (intrusive linked list) | 5,376,089 (±1.8%) | 186 | 5.0 collections, 104 ms | 125 ns | 375 ns | 0.92 µs | 1.8 µs | 6.1 µs | 36.7 ms |
+| **2. Books array + fewer id lookups** | 6,590,262 (±1.4%) | 152 | 4.0 collections, 85 ms | 84 ns | 334 ns | 0.92 µs | 3.6 µs | 12.1 µs | 44.6 ms |
+| **3. Primitive `long → Order` map** | **7,257,351** (±3.3%) | **138** | **3.0 collections, 39 ms** | **84 ns** | **292 ns** | **0.88 µs** | 2.6 µs | 9.5 µs | **35.4 ms** |
+
+| Step | Throughput | ns/event | GC time | p50 | p99 | p99.9 | p99.99 | max |
 |---|---|---|---|---|---|---|---|---|
-| **Baseline**: TreeMap + ArrayDeque + HashMap | 3,056,529 (±3%) | 327 | 167 ns | 2.5 µs | 7.8 µs | 54 µs | 143 ms | 8.6 collections, 369 ms |
-| **1. `PriceLevel`**: intrusive linked list, order → level back-pointer, running `totalQty` | 4,437,475 (±1.9%) | 225 | 125 ns | 1.1 µs | 5.4 µs | 16 µs | 82 ms | 5.0 collections, 213 ms |
-| *change vs previous* | **+45%** | −31% | −25% | **2.3× better** | −31% | **3.3× better** | −42% | −42% GC time |
-| **2. Books array + fewer id lookups** | 5,436,723 (±3.6%) | 184 | 84 ns | 1.1 µs | 6.5 µs | 31 µs | 114 ms | 4.2 collections, 220 ms |
-| *change vs previous* | **+22%** | −18% | **−33%** | same | worse | worse | worse | same |
-| *total vs baseline* | **+78%** | −44% | −50% | 2.3× better | −17% | 1.8× better | −20% | −40% GC time |
+| 1 vs baseline | **+19%** | −16% | −16% | −25% | −15% | **−33%** | −16% | −8% |
+| 2 vs 1 | **+23%** | −18% | −18% | **−33%** | same | **2× worse** | **2× worse** | +21% |
+| 3 vs 2 | **+10%** | −9% | **−54%** | same | −4% | −28% | −21% | −21% |
+| **3 vs baseline** | **+61%** | **−38%** | **−69%** | **−49%** | −19% | −3% | +32% | −12% |
+
+**Summary:** throughput +61%, median latency halved, GC time down 69%. The far tail (p99.9 and beyond) has not improved overall: change 2 doubled it and change 3 recovered only part of that. The cause is under investigation (see change 2).
+
+## Changes
 
 ### 1. `PriceLevel`
 
-**What changed:** each price level's `ArrayDeque<Order>` became a `PriceLevel` whose orders form an intrusive doubly linked list (`prev` / `next` fields on `Order`), and each resting order points back to its level. Removing an order (delete, full execution, cancel) now unlinks it in O(1) and only touches the `TreeMap` if the level becomes empty; before, it looked the level up in the `TreeMap` again and scanned the queue for the order. `volumeAt` reads a running total instead of summing the queue.
+**What changed:** each price level's `ArrayDeque<Order>` became a `PriceLevel` whose orders form an intrusive doubly linked list (`prev` / `next` fields on `Order`), and each resting order points back to its level. Removing an order (delete, full execution, cancel) unlinks it in O(1) and only touches the `TreeMap` if the level becomes empty; before, it looked the level up in the `TreeMap` again and scanned the queue for the order. `volumeAt` reads a running total instead of summing the queue.
 
 **Why the numbers moved:**
-- Throughput: removes the profile's two largest book hotspots, the repeated `TreeMap.getEntry` (~20% of samples) and the `ArrayDeque` scan (~11%).
-- Tail latency improved most (p99 2.3×, p99.99 3.3×): the slowest events were deletes deep in long queues around the open, which are now O(1).
-- GC down 42% despite `Order` gaining three fields: no `ArrayDeque` objects or backing arrays per level, which were allocated, grown and discarded as levels came and went.
+- Throughput +19%: removes the profile's two largest book hotspots, the repeated `TreeMap.getEntry` (~20% of samples) and the `ArrayDeque` scan (~11%).
+- p99.9 −33%: some of the slowest events were deletes deep in long queues around the open, now O(1).
+- GC −16% despite `Order` gaining three fields: no `ArrayDeque` objects or backing arrays per level.
 
-**Correctness:** 103 tests, including linked-list tests for every unlink position and 200,000 randomized operations with a full structural check (links, totals, counts, id index). A deliberately planted bug (tail not updated on removal) passed all 93 earlier tests and was caught only by the new ones. Replaying 150 MB of real ITCH through the old and new books gave identical results.
-
-**Still to fix:** the max (82 ms) is still a GC pause.
+**Correctness:** linked-list tests for every unlink position, and 200,000 randomized operations with a full structural check (links, totals, counts, id index). A deliberately planted bug (tail not updated on removal) passed all 93 earlier tests and was caught only by the new ones. Replaying 150 MB of real ITCH through the old and new books gave identical results.
 
 ### 2. Books array + fewer id lookups
 
@@ -45,15 +52,26 @@ Note: on Apple Silicon, `System.nanoTime()` ticks in steps of about 42 ns, so pe
 - `cancel` finds and removes the order with one `remove(id)` instead of `get(id)` + `remove(id)`.
 
 **Why the numbers moved:**
-- Throughput +22% and median −33%: the change removes a hash lookup from every message and a second id search from every add and delete, so it makes the *common case* cheaper.
-- The tail (p99.9 and above, max) did not improve. This change creates just as many objects as before (GC time unchanged), and the tail is dominated by GC pauses and rare costly operations such as creating a price level. The tail figures also come from a single timed run, where one GC pause landing differently moves p99.99 and the max considerably; throughput is averaged over five runs.
-- Lesson: throughput and tail latency respond to different fixes. Cheaper common paths raise throughput; a shorter tail needs fewer allocations (changes 3 and 5).
+- Throughput +23% and median −33%: one fewer hash lookup on every message and one fewer id search on every add and delete. The *common case* got cheaper.
+- **The tail got worse (p99.9 and p99.99 about 2×), reproduced in two separate sessions, so it isn't noise.** It isn't GC either: p99.9 is the slowest ~60,000 events, while a GC pause lands on only a handful. The cause is not yet known. Next step: break the slowest events down by type (add / execute / cancel / delete / replace) to find which operation is responsible.
 
-**Correctness:** all 103 tests pass; replaying 150 MB of real ITCH gives results identical to the original book.
+**Correctness:** all tests pass; replaying 150 MB of real ITCH gives results identical to the original book.
+
+### 3. Primitive `long → Order` map
+
+**What changed:** the id index went from `HashMap<Long, Order>` to `LongOrderMap`, an open-addressing hash map with primitive `long[]` keys and an `Order[]` of values: linear probing, backward-shift deletion (no tombstones), load factor 0.5, Fibonacci hashing to spread sequential ids. `HashMap` created a boxed `Long` and a `HashMap.Node` for every order; this map allocates nothing per entry once it has grown.
+
+**Why the numbers moved:**
+- **GC time −54% (85 → 39 ms per run):** for every *resting* order, the `Long` and `Node` lived as long as the order did, so they were part of what each collection had to copy and track. Removing them made every collection lighter.
+- Tail −21 to −28% (p99.9, p99.99, max): fewer and shorter pauses landing among the events.
+- Throughput +10%: lookups were already O(1); they're now cheaper, with no pointer-chasing through `Node` and `Long`.
+- Median unchanged (84 ns, 2 timer ticks): this change helps the outliers, not the typical event.
+
+**Correctness:** a differential test runs 1,000,000 random operations against both `LongOrderMap` and `java.util.HashMap` and checks they agree after every step, with a deliberately small key range so collisions, wrap-around and backward-shift deletes happen constantly. Two planted bugs (deleting by just emptying the slot; an off-by-one in the wrap-around check) were both caught by the new tests and missed by the earlier book tests. Real-data replay is identical to the original book.
 
 ## Where the time goes (full day, end to end)
 
-Same file, all 423,285,709 messages, timed stage by stage (`breakdown` command):
+Same file, all 423,285,709 messages, timed stage by stage (`breakdown` command), on the baseline version:
 
 | Stage | Time | Share |
 |---|---|---|
@@ -73,10 +91,11 @@ Same file, all 423,285,709 messages, timed stage by stage (`breakdown` command):
 
 GC pauses over the full day: 80 pauses, 4.5 s total; median 44 ms, p99 649 ms.
 
-## Planned changes, in order of the profile
+## Planned changes
 
-1. ~~`PriceLevel` with an intrusive doubly linked list, and each `Order` pointing back to its level~~ **done: +45%**
-2. ~~Books indexed by stock locate in an array; one id lookup instead of two on add~~ **done: +22% (+78% total)**
-3. Primitive `long → Order` map (no boxing)
-4. Faster price-level lookup for adds
-5. Object pooling to cut GC pauses
+1. ~~`PriceLevel` with an intrusive doubly linked list~~ **done: +19%**
+2. ~~Books indexed by stock locate; one id lookup instead of two~~ **done: +23%, tail regression under investigation**
+3. ~~Primitive `long → Order` map~~ **done: +10%, GC −54%**
+4. Find the cause of change 2's tail regression (slowest events broken down by type)
+5. Faster price-level lookup for adds
+6. Object pooling to cut remaining GC pauses
