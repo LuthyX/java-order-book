@@ -1,0 +1,45 @@
+Capturing up to 60,000,000 book events from data/01302020.NASDAQ_ITCH50.gz ...
+Captured 60,000,000 events in 6.4 s (reaches 10:01:47.963 New York time)
+
+warm-up 1    13.60 s      4,410,848 events/s
+warm-up 2    13.47 s      4,453,453 events/s
+warm-up 3    13.60 s      4,412,362 events/s
+run 1        13.02 s      4,609,733 events/s   GC: 5 collections, 160 ms
+run 2        14.10 s      4,254,637 events/s   GC: 5 collections, 227 ms
+run 3        12.50 s      4,799,811 events/s   GC: 5 collections, 182 ms
+run 4        12.48 s      4,806,523 events/s   GC: 5 collections, 180 ms
+run 5        12.47 s      4,811,935 events/s   GC: 5 collections, 190 ms
+run 6        12.36 s      4,854,213 events/s   GC: 5 collections, 191 ms
+run 7        12.75 s      4,705,455 events/s   GC: 5 collections, 184 ms
+run 8        12.36 s      4,852,963 events/s   GC: 5 collections, 189 ms
+run 9        12.48 s      4,808,853 events/s   GC: 5 collections, 180 ms
+run 10        12.42 s      4,832,496 events/s   GC: 5 collections, 179 ms
+latency run 1 done (p99.9 = 5,083 ns)
+latency run 2 done (p99.9 = 5,333 ns)
+latency run 3 done (p99.9 = 5,458 ns)
+
+=== Book benchmark ===
+Events per run      60,000,000
+Throughput (mean)   4,733,662 events/s   (211 ns per event)
+  min / max         4,254,637 / 4,854,213 events/s
+  spread (stdev)    3.7% of the mean
+GC per run (avg)    5.0 collections, 186 ms
+
+Latency per event (median of 3 timed runs; stopwatch overhead ~0 ns):
+  p50              166 ns     runs: 125 / 166 / 166
+  p90              417 ns     runs: 416 / 417 / 417
+  p99            1,042 ns     runs: 1,042 / 1,042 / 1,042
+  p99.9          5,333 ns     runs: 5,083 / 5,333 / 5,458
+  p99.99        12,667 ns     runs: 11,833 / 13,750 / 12,667
+  max       99,022,375 ns     runs: 101,214,708 / 96,685,375 / 99,022,375
+
+Slowest 0.1% of events (at or above each run's p99.9), by kind, all runs combined:
+  kind                    all events      share      in tail      share    ratio
+  add (A/F)               26,912,932      44.9%      110,004      60.8%     1.4x
+  execute (E/C)              957,096       1.6%        1,794       1.0%     0.6x
+  partial cancel (X)       1,826,727       3.0%        2,380       1.3%     0.4x
+  delete (D)              24,492,020      40.8%       28,672      15.8%     0.4x
+  replace (U)              5,811,225       9.7%       38,063      21.0%     2.2x
+  (ratio > 1: that kind is over-represented among the slowest events)
+
+(health: 0 unknown, 0 rejected; should both be 0)

@@ -11,9 +11,11 @@ MAVEN_OPTS="-Xmx8g" mvn -q compile exec:java -Dexec.args="bench data/01302020.NA
 
 **Why same-session matters:** the same code measured on different days varied by up to ~20% depending on power, background apps and temperature. An earlier, cross-day comparison credited `PriceLevel` with +45%; measured side by side with the baseline it is +19%. Only same-session comparisons are used here.
 
-**Timer note:** on Apple Silicon, `System.nanoTime()` ticks in steps of about 42 ns, so per-event latencies are rounded to that granularity (84 ns = 2 ticks) and values below ~50 ns aren't meaningful. Latency percentiles come from a single timed run, so the far tail (p99.99, max) is noisier than throughput, which is averaged over 10 runs.
+**Timer note:** on Apple Silicon, `System.nanoTime()` ticks in steps of about 42 ns, so per-event latencies are rounded to that granularity (84 ns = 2 ticks) and values below ~50 ns aren't meaningful.
 
-## Results
+**Tail-latency note:** the latency columns in the first table come from a **single** timed run per version, and later turned out to be unreliable for p99.9 and beyond (the same version's p99.9 varied from ~1.8 to ~5.5 µs between sessions). The benchmark now times three full runs and reports the median of each percentile; see [Tail latency, measured properly](#tail-latency-measured-properly). Throughput, GC and p50 in the first table are unaffected.
+
+## Results: throughput (all four versions, same session, November 7)
 
 | Version | Throughput (events/s) | ns/event | GC per run | p50 | p90 | p99 | p99.9 | p99.99 | max |
 |---|---|---|---|---|---|---|---|---|---|
@@ -29,7 +31,35 @@ MAVEN_OPTS="-Xmx8g" mvn -q compile exec:java -Dexec.args="bench data/01302020.NA
 | 3 vs 2 | **+10%** | −9% | **−54%** | same | −4% | −28% | −21% | −21% |
 | **3 vs baseline** | **+61%** | **−38%** | **−69%** | **−49%** | −19% | −3% | +32% | −12% |
 
-**Summary:** throughput +61%, median latency halved, GC time down 69%. The far tail (p99.9 and beyond) has not improved overall: change 2 doubled it and change 3 recovered only part of that. The cause is under investigation (see change 2).
+**Summary:** throughput +61%, median latency halved, GC time down 69%. (Ignore the p99.9 and p99.99 columns above: single-run values. The reliable tail numbers are in the next section.)
+
+## Tail latency, measured properly
+
+The three optimized versions measured again in one session (November 12) with `scripts/compare-versions.sh 17c8ab9 bc56c48 b8d92c4`, which swaps in each version's order-book code while keeping the same benchmark. Each latency figure is the **median of three fully timed runs**; the three individual values are shown for p99.9.
+
+| Version | Throughput | GC per run | p50 | p99 | p99.9 (median; 3 runs) | p99.99 | max |
+|---|---|---|---|---|---|---|---|
+| 1. `PriceLevel` | 4,733,662 (±3.7%) | 186 ms | 166 ns | 1,042 ns | **5,333 ns** (5,083 / 5,333 / 5,458) | 12,667 ns | 99 ms |
+| 2. Books array + fewer id lookups | 6,056,567 (±7.1%) | 138 ms | 125 ns | 916 ns | **4,750 ns** (5,042 / 4,542 / 4,750) | 12,208 ns | 80 ms |
+| 3. Primitive `long → Order` map | 7,236,914 (±1.2%) | 69 ms | 84 ns | 750 ns | **1,250 ns** (1,208 / 1,250 / 1,375) | 5,750 ns | 35 ms |
+
+**Which events are the slowest 0.1%?** For each run, every event at or above that run's p99.9 is counted by kind, then compared with how common that kind is overall. A ratio above 1 means the kind is over-represented among the slowest events.
+
+| Event kind | Share of all events | Ratio in tail: v1 | v2 | v3 |
+|---|---|---|---|---|
+| add (A/F) | 44.9% | 1.4× | 1.3× | **1.0×** |
+| execute (E/C) | 1.6% | 0.6× | 0.7× | 0.9× |
+| partial cancel (X) | 3.0% | 0.4× | 0.5× | 0.2× |
+| delete (D) | 40.8% | 0.4× | 0.4× | 0.7× |
+| replace (U) | 9.7% | 2.2× | 2.1× | **2.5×** |
+
+**Findings:**
+1. **Change 2 did not regress the tail.** Its p99.9 (4.75 µs) is slightly better than change 1's (5.3 µs), and its tail breakdown is almost identical. The earlier "2× worse" came from single latency runs in different sessions, where p99.9 for these versions moves between roughly 1.8 and 5.5 µs. Repeating the timed run and taking the median settled it.
+2. **Change 3 is what shortened the tail:** p99.9 3.8× better (4.75 → 1.25 µs), p99.99 2.1× better, max 80 → 35 ms, consistent across all three runs. Adds fell from 1.3–1.4× over-represented to exactly their normal share, so inserts into `HashMap<Long, Order>` (a boxed `Long` and a `Node` per order, scattered in memory, plus occasional table resizes) appear to have been the main source of slow events.
+3. **Replaces are now the clearest tail outlier** (24% of the slowest events from 9.7% of all events). A replace does three things in one event: look up the original order, cancel it (possibly removing an emptied price level), and add the new order (finding or creating its level). A dedicated replace operation that finds the original with a single `remove(id)` is the next tail target.
+4. **The worst case (35 ms) is still a garbage-collection pause.**
+
+Throughput in this session is lower for versions 1 and 2 than on November 7 (4.73M vs 5.38M; 6.06M vs 6.59M), and version 2 had a noisy run (±7.1%); version 3 matched (7.24M vs 7.26M). The ordering and the size of each step are consistent across both sessions.
 
 ## Changes
 
@@ -53,7 +83,7 @@ MAVEN_OPTS="-Xmx8g" mvn -q compile exec:java -Dexec.args="bench data/01302020.NA
 
 **Why the numbers moved:**
 - Throughput +23% and median −33%: one fewer hash lookup on every message and one fewer id search on every add and delete. The *common case* got cheaper.
-- **The tail got worse (p99.9 and p99.99 about 2×), reproduced in two separate sessions, so it isn't noise.** It isn't GC either: p99.9 is the slowest ~60,000 events, while a GC pause lands on only a handful. The cause is not yet known. Next step: break the slowest events down by type (add / execute / cancel / delete / replace) to find which operation is responsible.
+- **The tail did not get worse.** Single latency runs suggested p99.9 doubled, and two sessions seemed to agree, but with three timed runs per version measured side by side, change 2's p99.9 is slightly better than change 1's and its tail breakdown is almost identical. See [Tail latency, measured properly](#tail-latency-measured-properly). Lesson: a far-tail percentile from one run isn't a measurement.
 
 **Correctness:** all tests pass; replaying 150 MB of real ITCH gives results identical to the original book.
 
@@ -63,7 +93,7 @@ MAVEN_OPTS="-Xmx8g" mvn -q compile exec:java -Dexec.args="bench data/01302020.NA
 
 **Why the numbers moved:**
 - **GC time −54% (85 → 39 ms per run):** for every *resting* order, the `Long` and `Node` lived as long as the order did, so they were part of what each collection had to copy and track. Removing them made every collection lighter.
-- Tail −21 to −28% (p99.9, p99.99, max): fewer and shorter pauses landing among the events.
+- Tail: p99.9 **3.8× better** (4.75 → 1.25 µs, median of three runs) and max 80 → 35 ms. Adds stopped being over-represented among the slowest events, so `HashMap` inserts appear to have been the main source of the slow tail.
 - Throughput +10%: lookups were already O(1); they're now cheaper, with no pointer-chasing through `Node` and `Long`.
 - Median unchanged (84 ns, 2 timer ticks): this change helps the outliers, not the typical event.
 
@@ -94,8 +124,9 @@ GC pauses over the full day: 80 pauses, 4.5 s total; median 44 ms, p99 649 ms.
 ## Planned changes
 
 1. ~~`PriceLevel` with an intrusive doubly linked list~~ **done: +19%**
-2. ~~Books indexed by stock locate; one id lookup instead of two~~ **done: +23%, tail regression under investigation**
-3. ~~Primitive `long → Order` map~~ **done: +10%, GC −54%**
-4. Find the cause of change 2's tail regression (slowest events broken down by type)
-5. Faster price-level lookup for adds
-6. Object pooling to cut remaining GC pauses
+2. ~~Books indexed by stock locate; one id lookup instead of two~~ **done: +23%**
+3. ~~Primitive `long → Order` map~~ **done: +10%, GC −54%, p99.9 3.8× better**
+4. ~~Find the cause of change 2's tail regression~~ **resolved: no regression; it was single-run noise**
+5. A dedicated replace operation (replaces are 2.5× over-represented among the slowest events)
+6. Re-profile, then faster price-level lookup for adds
+7. Low-latency GC (generational ZGC) and/or object pooling for the remaining worst-case pauses

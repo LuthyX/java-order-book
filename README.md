@@ -30,15 +30,25 @@ NASDAQ top of book at the 4 p.m. close, as rebuilt by the replay:
 
 Measured on an Apple Silicon MacBook M2 Pro, JDK 21. Throughput above is a single end-to-end run.
 
-**Order book alone** (controlled benchmark: 60M real events from 3 a.m. to 10:01 a.m. including the open, replayed from memory, 3 warm-ups + 5 runs, full method in [BENCHMARKS.md](BENCHMARKS.md)):
+**Order book alone** (controlled benchmark: 60M real events from 3 a.m. to 10:01 a.m. including the open, replayed from memory, 3 warm-ups + 10 runs, **every version measured in the same session**; full method in [BENCHMARKS.md](BENCHMARKS.md)):
 
-| Version | Throughput | p50 | p99 | p99.9 | max |
-|---|---|---|---|---|---|
-| Baseline | 3.06M events/s (±3%), 327 ns/event | 167 ns | 2.5 µs | 7.8 µs | 143 ms (a GC pause) |
-| + `PriceLevel` (O(1) cancel) | **4.44M events/s (±1.9%), 225 ns/event: +45%** | 125 ns | **1.1 µs** | 5.4 µs | 82 ms |
-| + books array, fewer id lookups | **5.44M events/s (±3.6%), 184 ns/event: +22% (+78% total)** | **84 ns** | 1.1 µs | 6.5 µs | 114 ms |
+| Version | Throughput | GC per run | p50 |
+|---|---|---|---|
+| Baseline | 4.52M events/s, 221 ns/event | 124 ms | 166 ns |
+| + `PriceLevel` (O(1) cancel) | 5.38M events/s (+19%) | 104 ms | 125 ns |
+| + books array, fewer id lookups | 6.59M events/s (+23%) | 85 ms | 84 ns |
+| + primitive `long → Order` map | **7.26M events/s (+10%), 138 ns/event** | **39 ms** | **84 ns** |
+| **Total** | **+61%** | **−69%** | **−49%** |
 
-Throughput and median keep improving; the worst case is still set by garbage-collection pauses, which the remaining changes target.
+**Tail latency** (a separate same-session run of the three optimized versions; each figure is the median of three fully timed runs, because a single run proved too noisy for the far tail):
+
+| Version | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|
+| + `PriceLevel` | 1.04 µs | 5.3 µs | 12.7 µs | 99 ms |
+| + books array, fewer id lookups | 0.92 µs | 4.75 µs | 12.2 µs | 80 ms |
+| + primitive `long → Order` map | **0.75 µs** | **1.25 µs** | **5.75 µs** | **35 ms** |
+
+The primitive map is what shortened the tail: p99.9 dropped 3.8×, and adds, which had been over-represented among the slowest events, fell to their normal share. Inserts into `HashMap<Long, Order>` (a boxed key and an entry object per order) appear to have been the main source of slow events. An earlier apparent tail regression in the books-array change turned out to be an artifact of single-run measurement. The worst case is still a garbage-collection pause.
 
 **Where a full-day replay spends its time:** book updates **83%**, decompression 9%, parsing 7% (34M messages/s on its own), disk 1%. Profiling the book with JDK Flight Recorder points to `TreeMap` price-level lookups (~37% of samples), `HashMap` order lookups (~31%) and the O(n) queue scan on deletes (~11%), which set the order of the optimizations below.
 
@@ -67,7 +77,7 @@ The parser never touches a book and the book never sees a byte: the listener int
 
 **Prices are `long`s in 1/10,000 of a dollar**, the same units ITCH uses ($10.25 is `102_500`). `double` can't represent most decimal prices exactly (`0.1 + 0.2 != 0.3`), which would split equal prices into different price levels. `BigDecimal` is exact but allocates on every operation. A `long` is exact, allocation-free, and wide enough for unsigned 32-bit ITCH prices and price × quantity.
 
-**Each side is a `TreeMap<price, PriceLevel>`**, with bids in reverse order so `firstKey()` is the best price on both sides. Price priority comes from the map's ordering, time priority from each level's FIFO queue. A `HashMap<id, Order>` finds any resting order in O(1).
+**Each side is a `TreeMap<price, PriceLevel>`**, with bids in reverse order so `firstKey()` is the best price on both sides. Price priority comes from the map's ordering, time priority from each level's FIFO queue. An id index finds any resting order in O(1). It's a hand-written open-addressing map with primitive `long` keys, so indexing an order creates no boxed `Long` and no entry object.
 
 **Each `PriceLevel` is an intrusive doubly linked list.** The orders themselves are the list nodes (`prev` / `next` fields), and each order points back to its level. So once an order is found by id, removing it is two pointer updates, wherever it sits in the queue, and the `TreeMap` is only touched when a level becomes empty. A running `totalQty` makes the volume at a price O(1). Every change to a resting order's quantity goes through the level, so the total can't drift.
 
@@ -118,7 +128,7 @@ The `.gz` is decompressed while streaming, never unpacked to disk. The report pr
 
 ## Known limitations
 
-- **Garbage-collection pauses** still set the worst case (around 100 ms max): every order is a new object, and ids are boxed `Long`s in a `HashMap`. Planned fixes below.
+- **The worst case is still a garbage-collection pause** (~35 ms): every order is still a new object. And **replace messages are over-represented among the slowest events** (9.7% of events, 24% of the slowest 0.1%), because a replace is a lookup, a cancel and an add bundled together. Next steps below.
 - **NASDAQ's book only.** US stocks trade on many exchanges at once; this rebuilds NASDAQ's slice, not the consolidated best price (NBBO). Hidden orders never appear in ITCH, so trades against them (`P` messages) are counted but not applied.
 
 ## Roadmap
@@ -127,9 +137,10 @@ The `.gz` is decompressed while streaming, never unpacked to disk. The report pr
 - [x] ITCH 5.0 parser and full-day replay with health checks
 - [x] **Benchmarks** ([BENCHMARKS.md](BENCHMARKS.md)): stage-by-stage timing of the full day, an in-memory book benchmark with warm-up and repeated runs, per-event latency percentiles, and a JDK Flight Recorder profile
 - [ ] **Optimizations**, in the order the profile suggests, each measured before and after in [BENCHMARKS.md](BENCHMARKS.md):
-  - [x] `PriceLevel` with an intrusive doubly linked list of orders and a running total: O(1) cancel from anywhere, O(1) `volumeAt` (**+45% throughput, p99 2.3× better**)
-  - [x] array of books indexed by stock locate instead of a `HashMap`, and one id lookup instead of two on add and delete (**+22% throughput, median −33%**)
-  - primitive `long → Order` map instead of boxed `Long` keys
+  - [x] `PriceLevel` with an intrusive doubly linked list of orders and a running total: O(1) cancel from anywhere, O(1) `volumeAt` (**+19% throughput**)
+  - [x] array of books indexed by stock locate instead of a `HashMap`, and one id lookup instead of two on add and delete (**+23% throughput, median −33%**)
+  - [x] primitive `long → Order` map (open addressing, backward-shift delete) instead of `HashMap<Long, Order>`: no boxed key or entry object per order (**+10% throughput, GC time −54%, p99.9 3.8× better**)
+  - a dedicated replace operation: one id lookup instead of three (replaces are now the most over-represented event among the slowest 0.1%)
   - object pooling to cut garbage-collection pauses
 - [ ] Priority check against the real feed: does each execution hit the order my book says is first in line?
 - [ ] NIO TCP server so clients can submit orders over the network
