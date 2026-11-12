@@ -13,14 +13,15 @@ import java.util.Arrays;
  *   1. capture   decode the first N book events of the file once (CapturedEvents)
  *   2. warm up   a few untimed runs so the JIT compiles the hot code to machine code
  *   3. measure   several timed runs on fresh, empty books: mean, min, max, spread, GC
- *   4. latency   one extra run timing every single event: p50 / p99 / p99.9 / max
+ *   4. latency   extra runs timing every single event: p50 / p99 / p99.9 / max, the median
+ *                of each across runs, and which kinds of event make up the slowest 0.1%
  *
  * Usage:
- *     MAVEN_OPTS="-Xmx6g" mvn -q compile exec:java \
- *       -Dexec.args="bench data/01302020.NASDAQ_ITCH50.gz [events] [warmups] [runs]"
+ *     MAVEN_OPTS="-Xmx8g" mvn -q compile exec:java \
+ *       -Dexec.args="bench data/01302020.NASDAQ_ITCH50.gz [events] [warmups] [runs] [latencyRuns]"
  *
- * Defaults: 30,000,000 events, 3 warm-up runs, 5 measured runs.
- * Memory: about 38 bytes per captured event + 8 bytes per event for the latency run,
+ * Defaults: 30,000,000 events, 3 warm-up runs, 5 measured runs, 3 latency runs.
+ * Memory: about 38 bytes per captured event + 16 bytes per event for the latency runs,
  * plus the books themselves.
  *
  * Use this for every Phase 4 change: run it before, make the change, run it after,
@@ -32,13 +33,14 @@ public final class BookBenchmark {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 1) {
-            System.err.println("Usage: bench <itch-file[.gz]> [events] [warmups] [runs]");
+            System.err.println("Usage: bench <itch-file[.gz]> [events] [warmups] [runs] [latencyRuns]");
             System.exit(1);
         }
         String path = args[0];
         int maxEvents = args.length > 1 ? Integer.parseInt(args[1].replace("_", "")) : 30_000_000;
         int warmups = args.length > 2 ? Integer.parseInt(args[2]) : 3;
         int runs = args.length > 3 ? Integer.parseInt(args[3]) : 5;
+        int latencyRuns = args.length > 4 ? Integer.parseInt(args[4]) : 3;
 
         // ---- 1. capture ----
         System.out.printf("Capturing up to %,d book events from %s ...%n", maxEvents, path);
@@ -72,7 +74,7 @@ public final class BookBenchmark {
         double stdev = Math.sqrt(Arrays.stream(rates).map(x -> (x - mean) * (x - mean)).sum() / runs);
 
         // ---- 4. latency ----
-        LatencyResult lat = latencyRun(events);
+        LatencyResult lat = latencyRuns(events, latencyRuns);
 
         // ---- report ----
         System.out.println();
@@ -83,15 +85,46 @@ public final class BookBenchmark {
         System.out.printf("  spread (stdev)    %.1f%% of the mean%n", 100 * stdev / mean);
         System.out.printf("GC per run (avg)    %.1f collections, %d ms%n", (double) gcCount / runs, gcMillis / runs);
         System.out.println();
-        System.out.println("Latency per event (one timed run; includes ~" + lat.timerOverhead + " ns of stopwatch overhead):");
-        System.out.printf("  p50      %,10d ns%n", lat.p50);
-        System.out.printf("  p90      %,10d ns%n", lat.p90);
-        System.out.printf("  p99      %,10d ns%n", lat.p99);
-        System.out.printf("  p99.9    %,10d ns%n", lat.p999);
-        System.out.printf("  p99.99   %,10d ns%n", lat.p9999);
-        System.out.printf("  max      %,10d ns   (%.1f ms)%n", lat.max, lat.max / 1e6);
+        System.out.printf("Latency per event (median of %d timed runs; stopwatch overhead ~%d ns):%n",
+                latencyRuns, lat.timerOverhead);
+        String[] names = {"p50", "p90", "p99", "p99.9", "p99.99", "max"};
+        for (int p = 0; p < names.length; p++) {
+            long[] perRun = lat.percentiles[p];
+            System.out.printf("  %-7s %,12d ns     runs: %s%n", names[p], median(perRun), formatRuns(perRun));
+        }
+        System.out.println();
+
+        // Which kinds of event are the slowest 0.1%? If a kind's share of the tail is much bigger than
+        // its share of all events, that kind's code path is where the tail comes from.
+        System.out.println("Slowest 0.1% of events (at or above each run's p99.9), by kind, all runs combined:");
+        System.out.printf("  %-20s %13s %10s %12s %10s %8s%n", "kind", "all events", "share", "in tail", "share", "ratio");
+        long tailTotal = 0;
+        for (long c : lat.tailCounts) tailTotal += c;
+        for (int k = 1; k < CapturedEvents.KINDS; k++) {
+            double allShare = (double) lat.kindCounts[k] / n;
+            double tailShare = tailTotal == 0 ? 0 : (double) lat.tailCounts[k] / tailTotal;
+            System.out.printf("  %-20s %,13d %9.1f%% %,12d %9.1f%% %7.1fx%n",
+                    CapturedEvents.kindName(k), lat.kindCounts[k], 100 * allShare,
+                    lat.tailCounts[k], 100 * tailShare, allShare == 0 ? 0 : tailShare / allShare);
+        }
+        System.out.println("  (ratio > 1: that kind is over-represented among the slowest events)");
         System.out.println();
         System.out.println("(health: " + lat.unknown + " unknown, " + lat.rejected + " rejected; should both be 0)");
+    }
+
+    private static long median(long[] values) {
+        long[] copy = values.clone();
+        Arrays.sort(copy);
+        return copy[copy.length / 2];
+    }
+
+    private static String formatRuns(long[] values) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < values.length; i++) {
+            if (i > 0) sb.append(" / ");
+            sb.append(String.format("%,d", values[i]));
+        }
+        return sb.toString();
     }
 
     // ===================== throughput =====================
@@ -113,33 +146,63 @@ public final class BookBenchmark {
 
     // ===================== latency =====================
 
-    private record LatencyResult(long p50, long p90, long p99, long p999, long p9999, long max,
+    /**
+     * percentiles[p][run]: p50, p90, p99, p99.9, p99.99, max for each run.
+     * kindCounts[k]: how many events of kind k there are in one run.
+     * tailCounts[k]: how many events of kind k were at or above p99.9, summed over all runs.
+     */
+    private record LatencyResult(long[][] percentiles, long[] kindCounts, long[] tailCounts,
                                  long timerOverhead, long unknown, long rejected) {}
 
-    private static LatencyResult latencyRun(CapturedEvents events) {
+    private static LatencyResult latencyRuns(CapturedEvents events, int runs) {
         int n = events.size();
-        long[] latencies = new long[n];
+        long[] latencies = new long[n];   // latencies[i] belongs to event i (NOT sorted)
+        long[] sorted = new long[n];      // a sorted copy, to read percentiles from
 
         // How much does the stopwatch itself cost? Time an empty body the same way.
         for (int i = 0; i < n; i++) {
             long s = System.nanoTime();
-            latencies[i] = System.nanoTime() - s;
+            sorted[i] = System.nanoTime() - s;
         }
-        Arrays.sort(latencies);
-        long overhead = latencies[n / 2];
+        Arrays.sort(sorted);
+        long overhead = sorted[n / 2];
 
-        ReplayListener replay = new ReplayListener();
-        System.gc();
-        for (int i = 0; i < n; i++) {
-            long s = System.nanoTime();
-            events.apply(i, replay);
-            latencies[i] = System.nanoTime() - s;
+        long[] kindCounts = new long[CapturedEvents.KINDS];
+        for (int i = 0; i < n; i++) kindCounts[events.kind(i)]++;
+
+        long[][] percentiles = new long[6][runs];
+        long[] tailCounts = new long[CapturedEvents.KINDS];
+        long unknown = 0, rejected = 0;
+
+        for (int r = 0; r < runs; r++) {
+            ReplayListener replay = new ReplayListener();
+            System.gc();
+            for (int i = 0; i < n; i++) {
+                long s = System.nanoTime();
+                events.apply(i, replay);
+                latencies[i] = System.nanoTime() - s;
+            }
+            unknown += replay.unknownOrderEvents();
+            rejected += replay.rejectedEvents();
+
+            // Percentiles: sort a COPY, so latencies[] still lines up with the events.
+            System.arraycopy(latencies, 0, sorted, 0, n);
+            Arrays.sort(sorted);   // sorted: the value at position p * n is the p-th percentile
+            percentiles[0][r] = at(sorted, 0.50);
+            percentiles[1][r] = at(sorted, 0.90);
+            percentiles[2][r] = at(sorted, 0.99);
+            percentiles[3][r] = at(sorted, 0.999);
+            percentiles[4][r] = at(sorted, 0.9999);
+            percentiles[5][r] = sorted[n - 1];
+
+            // Tail breakdown: which kinds of event took at least this run's p99.9?
+            long threshold = percentiles[3][r];
+            for (int i = 0; i < n; i++) {
+                if (latencies[i] >= threshold) tailCounts[events.kind(i)]++;
+            }
+            System.out.printf("latency run %d done (p99.9 = %,d ns)%n", r + 1, threshold);
         }
-        Arrays.sort(latencies);   // sorted: the value at position p * n is the p-th percentile
-        return new LatencyResult(
-                at(latencies, 0.50), at(latencies, 0.90), at(latencies, 0.99),
-                at(latencies, 0.999), at(latencies, 0.9999), latencies[n - 1],
-                overhead, replay.unknownOrderEvents(), replay.rejectedEvents());
+        return new LatencyResult(percentiles, kindCounts, tailCounts, overhead, unknown, rejected);
     }
 
     private static long at(long[] sorted, double percentile) {

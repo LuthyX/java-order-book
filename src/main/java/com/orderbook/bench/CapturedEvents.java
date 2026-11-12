@@ -50,6 +50,24 @@ public final class CapturedEvents {
 
     public int size() { return size; }
 
+    /** Number of event kinds, for arrays indexed by kind (index 0 is unused). */
+    static final int KINDS = 6;
+
+    /** The kind of event i: ADD, EXECUTE, CANCEL, DELETE or REPLACE. */
+    byte kind(int i) { return kind[i]; }
+
+    /** A readable name for an event kind, for reports. */
+    static String kindName(int k) {
+        return switch (k) {
+            case ADD -> "add (A/F)";
+            case EXECUTE -> "execute (E/C)";
+            case CANCEL -> "partial cancel (X)";
+            case DELETE -> "delete (D)";
+            case REPLACE -> "replace (U)";
+            default -> "?";
+        };
+    }
+
     /** Time of day (ns since midnight) of the last captured event: how far into the day the slice reaches. */
     public long lastTimestamp() { return lastTimestamp; }
 
